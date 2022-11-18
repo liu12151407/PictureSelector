@@ -1,90 +1,113 @@
 package com.luck.picture.lib.model;
 
+import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
-import android.os.Bundle;
 import android.provider.MediaStore;
-import android.support.v4.app.FragmentActivity;
-import android.support.v4.app.LoaderManager;
-import android.support.v4.content.CursorLoader;
-import android.support.v4.content.Loader;
+import android.text.TextUtils;
 
 import com.luck.picture.lib.R;
 import com.luck.picture.lib.config.PictureConfig;
 import com.luck.picture.lib.config.PictureMimeType;
+import com.luck.picture.lib.config.PictureSelectionConfig;
 import com.luck.picture.lib.entity.LocalMedia;
 import com.luck.picture.lib.entity.LocalMediaFolder;
+import com.luck.picture.lib.listener.OnQueryDataResultListener;
+import com.luck.picture.lib.thread.PictureThreadUtils;
+import com.luck.picture.lib.tools.SdkVersionUtils;
+import com.luck.picture.lib.tools.SortUtils;
 
 import java.io.File;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 
-
 /**
- * author：luck
- * project：LocalMediaLoader
- * package：com.luck.picture.ui
- * email：893855882@qq.com
- * data：16/12/31
+ * @author：luck
+ * @data：2016/12/31 19:12
+ * @describe: Local media database query class
  */
-
-public class LocalMediaLoader {
+@Deprecated
+public final class LocalMediaLoader extends IBridgeMediaLoader {
+    private static final String TAG = LocalMediaLoader.class.getSimpleName();
     private static final Uri QUERY_URI = MediaStore.Files.getContentUri("external");
     private static final String ORDER_BY = MediaStore.Files.FileColumns._ID + " DESC";
-    private static final String DURATION = "duration";
-    private static final String NOT_GIF = "!='image/gif'";
-    private static final int AUDIO_DURATION = 500;// 过滤掉小于500毫秒的录音
-    private int type = PictureConfig.TYPE_IMAGE;
-    private FragmentActivity activity;
-    private boolean isGif;
-    private long videoMaxS = 0;
-    private long videoMinS = 0;
-
-    // 媒体文件数据库字段
+    private static final String NOT_GIF_UNKNOWN = "!='image/*'";
+    private static final String NOT_GIF = " AND (" + MediaStore.MediaColumns.MIME_TYPE + "!='image/gif' AND " + MediaStore.MediaColumns.MIME_TYPE + NOT_GIF_UNKNOWN + ")";
+    private static final int MAX_SORT_SIZE = 60;
+    private final Context mContext;
+    private final boolean isAndroidQ;
+    private final PictureSelectionConfig config;
+    /**
+     * unit
+     */
+    private static final long FILE_SIZE_UNIT = 1024 * 1024L;
+    /**
+     * Media file database field
+     */
     private static final String[] PROJECTION = {
             MediaStore.Files.FileColumns._ID,
             MediaStore.MediaColumns.DATA,
             MediaStore.MediaColumns.MIME_TYPE,
             MediaStore.MediaColumns.WIDTH,
             MediaStore.MediaColumns.HEIGHT,
-            DURATION};
-
-    // 图片
-    private static final String SELECTION = MediaStore.Files.FileColumns.MEDIA_TYPE + "=?"
-            + " AND " + MediaStore.MediaColumns.SIZE + ">0";
-
-    private static final String SELECTION_NOT_GIF = MediaStore.Files.FileColumns.MEDIA_TYPE + "=?"
-            + " AND " + MediaStore.MediaColumns.SIZE + ">0"
-            + " AND " + MediaStore.MediaColumns.MIME_TYPE + NOT_GIF;
-
-    // 查询条件(音视频)
-    private static String getSelectionArgsForSingleMediaCondition(String time_condition) {
-        return MediaStore.Files.FileColumns.MEDIA_TYPE + "=?"
-                + " AND " + MediaStore.MediaColumns.SIZE + ">0"
-                + " AND " + time_condition;
-    }
-
-    // 全部模式下条件
-    private static String getSelectionArgsForAllMediaCondition(String time_condition, boolean isGif) {
-        String condition = "(" + MediaStore.Files.FileColumns.MEDIA_TYPE + "=?"
-                + (isGif ? "" : " AND " + MediaStore.MediaColumns.MIME_TYPE + NOT_GIF)
-                + " OR "
-                + (MediaStore.Files.FileColumns.MEDIA_TYPE + "=? AND " + time_condition) + ")"
-                + " AND " + MediaStore.MediaColumns.SIZE + ">0";
-        return condition;
-    }
-
-    // 获取图片or视频
-    private static final String[] SELECTION_ALL_ARGS = {
-            String.valueOf(MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE),
-            String.valueOf(MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO),
-    };
+            MediaStore.MediaColumns.DURATION,
+            MediaStore.MediaColumns.SIZE,
+            MediaStore.MediaColumns.BUCKET_DISPLAY_NAME,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.BUCKET_ID,
+            MediaStore.MediaColumns.DATE_ADDED};
 
     /**
-     * 获取指定类型的文件
+     * Video or Audio mode conditions
+     *
+     * @param sizeCondition
+     * @param queryMimeCondition
+     * @return
+     */
+    private static String getSelectionArgsForVideoOrAudioMediaCondition(String sizeCondition, String queryMimeCondition) {
+        return MediaStore.Files.FileColumns.MEDIA_TYPE + "=?" + queryMimeCondition + " AND " + sizeCondition;
+    }
+
+    /**
+     * Query conditions in all modes
+     *
+     * @param timeCondition
+     * @param sizeCondition
+     * @param queryMimeCondition
+     * @return
+     */
+    private static String getSelectionArgsForAllMediaCondition(String timeCondition, String sizeCondition, String queryMimeCondition) {
+        StringBuilder stringBuilder = new StringBuilder();
+        stringBuilder.append("(").append(MediaStore.Files.FileColumns.MEDIA_TYPE).append("=?").append(queryMimeCondition).append(" OR ")
+                .append(MediaStore.Files.FileColumns.MEDIA_TYPE).append("=? AND ").append(timeCondition).append(") AND ").append(sizeCondition).toString();
+        return stringBuilder.toString();
+    }
+
+    /**
+     * Query conditions in image modes
+     *
+     * @param sizeCondition
+     * @param queryMimeCondition
+     * @return
+     */
+    private static String getSelectionArgsForImageMediaCondition(String sizeCondition, String queryMimeCondition) {
+        return MediaStore.Files.FileColumns.MEDIA_TYPE + "=?" + queryMimeCondition + " AND " + sizeCondition;
+    }
+
+    /**
+     * Gets a file of the specified type
+     *
+     * @return
+     */
+    private static String[] getSelectionArgsForAllMediaType() {
+        return new String[]{String.valueOf(MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE), String.valueOf(MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO)};
+    }
+
+    /**
+     * Gets a file of the specified type
      *
      * @param mediaType
      * @return
@@ -93,184 +116,342 @@ public class LocalMediaLoader {
         return new String[]{String.valueOf(mediaType)};
     }
 
-    public LocalMediaLoader(FragmentActivity activity, int type, boolean isGif, long videoMaxS, long videoMinS) {
-        this.activity = activity;
-        this.type = type;
-        this.isGif = isGif;
-        this.videoMaxS = videoMaxS;
-        this.videoMinS = videoMinS;
+
+    public LocalMediaLoader(Context context,PictureSelectionConfig config) {
+        this.mContext = context.getApplicationContext();
+        this.isAndroidQ = SdkVersionUtils.isQ();
+        this.config = config;
     }
 
-    public void loadAllMedia(final LocalMediaLoadListener imageLoadListener) {
-        activity.getSupportLoaderManager().initLoader(type, null,
-                new LoaderManager.LoaderCallbacks<Cursor>() {
-                    @Override
-                    public Loader<Cursor> onCreateLoader(int id, Bundle args) {
-                        CursorLoader cursorLoader = null;
-                        switch (id) {
-                            case PictureConfig.TYPE_ALL:
-                                String all_condition = getSelectionArgsForAllMediaCondition(getDurationCondition(0, 0), isGif);
-                                cursorLoader = new CursorLoader(
-                                        activity, QUERY_URI,
-                                        PROJECTION, all_condition,
-                                        SELECTION_ALL_ARGS, ORDER_BY);
-                                break;
-                            case PictureConfig.TYPE_IMAGE:
-                                // 只获取图片
-                                String[] MEDIA_TYPE_IMAGE = getSelectionArgsForSingleMediaType(MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE);
-                                cursorLoader = new CursorLoader(
-                                        activity, QUERY_URI,
-                                        PROJECTION, isGif ? SELECTION : SELECTION_NOT_GIF, MEDIA_TYPE_IMAGE
-                                        , ORDER_BY);
-                                break;
-                            case PictureConfig.TYPE_VIDEO:
-                                // 只获取视频
-                                String video_condition = getSelectionArgsForSingleMediaCondition(getDurationCondition(0, 0));
-                                String[] MEDIA_TYPE_VIDEO = getSelectionArgsForSingleMediaType(MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO);
-                                cursorLoader = new CursorLoader(
-                                        activity, QUERY_URI, PROJECTION, video_condition, MEDIA_TYPE_VIDEO
-                                        , ORDER_BY);
-                                break;
-                            case PictureConfig.TYPE_AUDIO:
-                                String audio_condition = getSelectionArgsForSingleMediaCondition(getDurationCondition(0, AUDIO_DURATION));
-                                String[] MEDIA_TYPE_AUDIO = getSelectionArgsForSingleMediaType(MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO);
-                                cursorLoader = new CursorLoader(
-                                        activity, QUERY_URI, PROJECTION, audio_condition, MEDIA_TYPE_AUDIO
-                                        , ORDER_BY);
-                                break;
-                        }
-                        return cursorLoader;
-                    }
+    @Override
+    public void loadOnlyInAppDirectoryAllMedia(OnQueryDataResultListener<LocalMediaFolder> listener) {
+         PictureThreadUtils.executeByIo(new PictureThreadUtils.SimpleTask<LocalMediaFolder>() {
 
-                    @Override
-                    public void onLoadFinished(Loader<Cursor> loader, Cursor data) {
-                        try {
-                            List<LocalMediaFolder> imageFolders = new ArrayList<>();
-                            LocalMediaFolder allImageFolder = new LocalMediaFolder();
-                            List<LocalMedia> latelyImages = new ArrayList<>();
-                            if (data != null) {
-                                int count = data.getCount();
-                                if (count > 0) {
-                                    data.moveToFirst();
-                                    do {
-                                        String path = data.getString
-                                                (data.getColumnIndexOrThrow(PROJECTION[1]));
+             @Override
+             public LocalMediaFolder doInBackground() {
+                 return SandboxFileLoader.loadInAppSandboxFolderFile(mContext, config.sandboxFolderPath);
+             }
 
-                                        String pictureType = data.getString
-                                                (data.getColumnIndexOrThrow(PROJECTION[2]));
+             @Override
+             public void onSuccess(LocalMediaFolder result) {
+                 PictureThreadUtils.cancel(PictureThreadUtils.getIoPool());
+                 if (listener != null) {
+                     listener.onComplete(result);
+                 }
+             }
+         });
+    }
 
-                                        int w = data.getInt
-                                                (data.getColumnIndexOrThrow(PROJECTION[3]));
+    @Override
+    public void loadAllMedia(OnQueryDataResultListener<LocalMediaFolder> listener) {
+        PictureThreadUtils.executeByIo(new PictureThreadUtils.SimpleTask<List<LocalMediaFolder>>() {
 
-                                        int h = data.getInt
-                                                (data.getColumnIndexOrThrow(PROJECTION[4]));
+            @Override
+            public List<LocalMediaFolder> doInBackground() {
+                List<LocalMediaFolder> imageFolders = new ArrayList<>();
+                Cursor data = mContext.getContentResolver().query(QUERY_URI, PROJECTION,
+                        getSelection(), getSelectionArgs(), ORDER_BY);
+                try {
+                    if (data != null) {
+                        LocalMediaFolder allImageFolder = new LocalMediaFolder();
+                        List<LocalMedia> latelyImages = new ArrayList<>();
+                        int count = data.getCount();
+                        if (count > 0) {
+                            int idColumn = data.getColumnIndexOrThrow(PROJECTION[0]);
+                            int dataColumn = data.getColumnIndexOrThrow(PROJECTION[1]);
+                            int mimeTypeColumn = data.getColumnIndexOrThrow(PROJECTION[2]);
+                            int widthColumn = data.getColumnIndexOrThrow(PROJECTION[3]);
+                            int heightColumn = data.getColumnIndexOrThrow(PROJECTION[4]);
+                            int durationColumn = data.getColumnIndexOrThrow(PROJECTION[5]);
+                            int sizeColumn = data.getColumnIndexOrThrow(PROJECTION[6]);
+                            int folderNameColumn = data.getColumnIndexOrThrow(PROJECTION[7]);
+                            int fileNameColumn = data.getColumnIndexOrThrow(PROJECTION[8]);
+                            int bucketIdColumn = data.getColumnIndexOrThrow(PROJECTION[9]);
+                            int dateAddedColumn = data.getColumnIndexOrThrow(PROJECTION[10]);
 
-                                        int duration = data.getInt
-                                                (data.getColumnIndexOrThrow(PROJECTION[5]));
-
-                                        LocalMedia image = new LocalMedia
-                                                (path, duration, type, pictureType, w, h);
-
-                                        LocalMediaFolder folder = getImageFolder(path, imageFolders);
-                                        List<LocalMedia> images = folder.getImages();
-                                        images.add(image);
-                                        folder.setImageNum(folder.getImageNum() + 1);
-                                        latelyImages.add(image);
-                                        int imageNum = allImageFolder.getImageNum();
-                                        allImageFolder.setImageNum(imageNum + 1);
-                                    } while (data.moveToNext());
-
-                                    if (latelyImages.size() > 0) {
-                                        sortFolder(imageFolders);
-                                        imageFolders.add(0, allImageFolder);
-                                        allImageFolder.setFirstImagePath
-                                                (latelyImages.get(0).getPath());
-                                        String title = type == PictureMimeType.ofAudio() ?
-                                                activity.getString(R.string.picture_all_audio)
-                                                : activity.getString(R.string.picture_camera_roll);
-                                        allImageFolder.setName(title);
-                                        allImageFolder.setImages(latelyImages);
+                            data.moveToFirst();
+                            do {
+                                long id = data.getLong(idColumn);
+                                String mimeType = data.getString(mimeTypeColumn);
+                                mimeType = TextUtils.isEmpty(mimeType) ? PictureMimeType.ofJPEG() : mimeType;
+                                String absolutePath = data.getString(dataColumn);
+                                String url = isAndroidQ ? PictureMimeType.getRealPathUri(id,mimeType) : absolutePath;
+                                // Here, it is solved that some models obtain mimeType and return the format of image / *,
+                                // which makes it impossible to distinguish the specific type, such as mi 8,9,10 and other models
+                                if (mimeType.endsWith("image/*")) {
+                                    if (PictureMimeType.isContent(url)) {
+                                        mimeType = PictureMimeType.getImageMimeType(absolutePath);
+                                    } else {
+                                        mimeType = PictureMimeType.getImageMimeType(url);
                                     }
-                                    imageLoadListener.loadComplete(imageFolders);
-                                } else {
-                                    // 如果没有相册
-                                    imageLoadListener.loadComplete(imageFolders);
+                                    if (!config.isGif) {
+                                        boolean isGif = PictureMimeType.isGif(mimeType);
+                                        if (isGif) {
+                                            continue;
+                                        }
+                                    }
+                                }
+                                if (!config.isWebp) {
+                                    if (mimeType.startsWith(PictureMimeType.ofWEBP())) {
+                                        continue;
+                                    }
+                                }
+                                if (!config.isBmp) {
+                                    if (mimeType.startsWith(PictureMimeType.ofBMP())) {
+                                        continue;
+                                    }
+                                }
+
+                                int width = data.getInt(widthColumn);
+                                int height = data.getInt(heightColumn);
+                                long duration = data.getLong(durationColumn);
+                                long size = data.getLong(sizeColumn);
+                                String folderName = data.getString(folderNameColumn);
+                                String fileName = data.getString(fileNameColumn);
+                                long bucketId = data.getLong(bucketIdColumn);
+                                if (config.filterFileSize > 0) {
+                                    if (size > config.filterFileSize * FILE_SIZE_UNIT) {
+                                        continue;
+                                    }
+                                }
+
+                                if (PictureMimeType.isHasVideo(mimeType)) {
+                                    if (config.videoMinSecond > 0 && duration < config.videoMinSecond) {
+                                        // If you set the minimum number of seconds of video to display
+                                        continue;
+                                    }
+                                    if (config.videoMaxSecond > 0 && duration > config.videoMaxSecond) {
+                                        // If you set the maximum number of seconds of video to display
+                                        continue;
+                                    }
+                                    if (duration == 0) {
+                                        //If the length is 0, the corrupted video is processed and filtered out
+                                        continue;
+                                    }
+                                    if (size <= 0) {
+                                        // The video size is 0 to filter out
+                                        continue;
+                                    }
+                                }
+                                LocalMedia image = LocalMedia.parseLocalMedia(id, url, absolutePath, fileName, folderName, duration, config.chooseMode, mimeType, width, height, size, bucketId, data.getLong(dateAddedColumn));
+                                LocalMediaFolder folder = getImageFolder(url,mimeType, folderName, imageFolders);
+                                folder.setBucketId(image.getBucketId());
+                                List<LocalMedia> images = folder.getData();
+                                images.add(image);
+                                folder.setImageNum(folder.getImageNum() + 1);
+                                folder.setBucketId(image.getBucketId());
+                                latelyImages.add(image);
+                                int imageNum = allImageFolder.getImageNum();
+                                allImageFolder.setImageNum(imageNum + 1);
+
+                            } while (data.moveToNext());
+
+                            LocalMediaFolder selfFolder = SandboxFileLoader.loadInAppSandboxFolderFile(mContext, config.sandboxFolderPath);
+                            if (selfFolder != null) {
+                                imageFolders.add(selfFolder);
+                                allImageFolder.setImageNum(allImageFolder.getImageNum() + selfFolder.getImageNum());
+                                allImageFolder.setData(selfFolder.getData());
+                                latelyImages.addAll(0, selfFolder.getData());
+                                if (MAX_SORT_SIZE > selfFolder.getImageNum()) {
+                                    if (latelyImages.size() > MAX_SORT_SIZE) {
+                                        SortUtils.sortLocalMediaAddedTime(latelyImages.subList(0, MAX_SORT_SIZE));
+                                    } else {
+                                        SortUtils.sortLocalMediaAddedTime(latelyImages);
+                                    }
                                 }
                             }
-                        } catch (Exception e) {
-                            e.printStackTrace();
+
+                            if (latelyImages.size() > 0) {
+                                SortUtils.sortFolder(imageFolders);
+                                imageFolders.add(0, allImageFolder);
+                                allImageFolder.setFirstImagePath
+                                        (latelyImages.get(0).getPath());
+                                allImageFolder.setFirstMimeType(latelyImages.get(0).getMimeType());
+                                String title = config.chooseMode == PictureMimeType.ofAudio() ?
+                                        mContext.getString(R.string.picture_all_audio)
+                                        : mContext.getString(R.string.picture_camera_roll);
+                                allImageFolder.setName(title);
+                                allImageFolder.setBucketId(-1);
+                                allImageFolder.setOfAllType(config.chooseMode);
+                                allImageFolder.setCameraFolder(true);
+                                allImageFolder.setData(latelyImages);
+                            }
                         }
                     }
-
-                    @Override
-                    public void onLoaderReset(Loader<Cursor> loader) {
+                } catch (Exception e) {
+                    e.printStackTrace();
+                } finally {
+                    if (data != null && !data.isClosed()) {
+                        data.close();
                     }
-                });
-    }
-
-    /**
-     * 文件夹数量进行排序
-     *
-     * @param imageFolders
-     */
-    private void sortFolder(List<LocalMediaFolder> imageFolders) {
-        // 文件夹按图片数量排序
-        Collections.sort(imageFolders, new Comparator<LocalMediaFolder>() {
-            @Override
-            public int compare(LocalMediaFolder lhs, LocalMediaFolder rhs) {
-                if (lhs.getImages() == null || rhs.getImages() == null) {
-                    return 0;
                 }
-                int lsize = lhs.getImageNum();
-                int rsize = rhs.getImageNum();
-                return lsize == rsize ? 0 : (lsize < rsize ? 1 : -1);
+                return imageFolders;
+            }
+
+            @Override
+            public void onSuccess(List<LocalMediaFolder> result) {
+                PictureThreadUtils.cancel(PictureThreadUtils.getIoPool());
+                if (listener != null) {
+                    listener.onComplete(result);
+                }
             }
         });
     }
 
+    private String getSelection() {
+        String durationCondition = getDurationCondition();
+        String fileSizeCondition = getFileSizeCondition();
+        String queryMimeCondition = getQueryMimeCondition();
+        switch (config.chooseMode) {
+            case PictureConfig.TYPE_ALL:
+                // Get all, not including audio
+                return getSelectionArgsForAllMediaCondition(durationCondition, fileSizeCondition, queryMimeCondition);
+            case PictureConfig.TYPE_IMAGE:
+                // Gets the image
+                return getSelectionArgsForImageMediaCondition(fileSizeCondition, queryMimeCondition);
+            case PictureConfig.TYPE_VIDEO:
+                // Access to video
+                return getSelectionArgsForVideoOrAudioMediaCondition(fileSizeCondition, queryMimeCondition);
+            case PictureConfig.TYPE_AUDIO:
+                // Access to the audio
+                return getSelectionArgsForVideoOrAudioMediaCondition(durationCondition, queryMimeCondition);
+        }
+        return null;
+    }
+
+    private String[] getSelectionArgs() {
+        switch (config.chooseMode) {
+            case PictureConfig.TYPE_ALL:
+                // Get All
+                return getSelectionArgsForAllMediaType();
+            case PictureConfig.TYPE_IMAGE:
+                // Get Image
+                return getSelectionArgsForSingleMediaType(MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE);
+            case PictureConfig.TYPE_VIDEO:
+                // Get Video
+                return getSelectionArgsForSingleMediaType(MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO);
+            case PictureConfig.TYPE_AUDIO:
+                // Get Audio
+                return getSelectionArgsForSingleMediaType(MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO);
+        }
+        return null;
+    }
+
+
     /**
-     * 创建相应文件夹
+     * Create folder
      *
-     * @param path
+     * @param firstPath
+     * @param firstMimeType
      * @param imageFolders
+     * @param folderName
      * @return
      */
-    private LocalMediaFolder getImageFolder(String path, List<LocalMediaFolder> imageFolders) {
-        File imageFile = new File(path);
-        File folderFile = imageFile.getParentFile();
-        for (LocalMediaFolder folder : imageFolders) {
-            // 同一个文件夹下，返回自己，否则创建新文件夹
-            if (folder.getName().equals(folderFile.getName())) {
-                return folder;
+    private LocalMediaFolder getImageFolder(String firstPath,String firstMimeType, String folderName, List<LocalMediaFolder> imageFolders) {
+        if (!config.isFallbackVersion) {
+            for (LocalMediaFolder folder : imageFolders) {
+                // Under the same folder, return yourself, otherwise create a new folder
+                String name = folder.getName();
+                if (TextUtils.isEmpty(name)) {
+                    continue;
+                }
+                if (name.equals(folderName)) {
+                    return folder;
+                }
             }
+            LocalMediaFolder newFolder = new LocalMediaFolder();
+            newFolder.setName(folderName);
+            newFolder.setFirstImagePath(firstPath);
+            newFolder.setFirstMimeType(firstMimeType);
+            imageFolders.add(newFolder);
+            return newFolder;
+        } else {
+            // Fault-tolerant processing
+            File imageFile = new File(firstPath);
+            File folderFile = imageFile.getParentFile();
+            for (LocalMediaFolder folder : imageFolders) {
+                // Under the same folder, return yourself, otherwise create a new folder
+                String name = folder.getName();
+                if (TextUtils.isEmpty(name)) {
+                    continue;
+                }
+                if (folderFile != null && name.equals(folderFile.getName())) {
+                    return folder;
+                }
+            }
+            LocalMediaFolder newFolder = new LocalMediaFolder();
+            newFolder.setName(folderFile != null ? folderFile.getName() : "");
+            newFolder.setFirstImagePath(firstPath);
+            newFolder.setFirstMimeType(firstMimeType);
+            imageFolders.add(newFolder);
+            return newFolder;
         }
-        LocalMediaFolder newFolder = new LocalMediaFolder();
-        newFolder.setName(folderFile.getName());
-        newFolder.setPath(folderFile.getAbsolutePath());
-        newFolder.setFirstImagePath(path);
-        imageFolders.add(newFolder);
-        return newFolder;
     }
 
     /**
-     * 获取视频(最长或最小时间)
+     * Get video (maximum or minimum time)
      *
-     * @param exMaxLimit
-     * @param exMinLimit
      * @return
      */
-    private String getDurationCondition(long exMaxLimit, long exMinLimit) {
-        long maxS = videoMaxS == 0 ? Long.MAX_VALUE : videoMaxS;
-        if (exMaxLimit != 0) maxS = Math.min(maxS, exMaxLimit);
-
-        return String.format(Locale.CHINA, "%d <%s duration and duration <= %d",
-                Math.max(exMinLimit, videoMinS),
-                Math.max(exMinLimit, videoMinS) == 0 ? "" : "=",
+    private String getDurationCondition() {
+        long maxS = config.videoMaxSecond == 0 ? Long.MAX_VALUE : config.videoMaxSecond;
+        return String.format(Locale.CHINA, "%d <%s " + MediaStore.MediaColumns.DURATION + " and " + MediaStore.MediaColumns.DURATION + " <= %d",
+                Math.max((long) 0, config.videoMinSecond),
+                Math.max((long) 0, config.videoMinSecond) == 0 ? "" : "=",
                 maxS);
     }
 
-
-    public interface LocalMediaLoadListener {
-        void loadComplete(List<LocalMediaFolder> folders);
+    /**
+     * Get media size (maxFileSize or miniFileSize)
+     *
+     * @return
+     */
+    private String getFileSizeCondition() {
+        long maxS = config.filterMaxFileSize == 0 ? Long.MAX_VALUE : config.filterMaxFileSize;
+        return String.format(Locale.CHINA, "%d <%s " + MediaStore.MediaColumns.SIZE + " and " + MediaStore.MediaColumns.SIZE + " <= %d",
+                Math.max(0, config.filterMinFileSize),
+                Math.max(0, config.filterMinFileSize) == 0 ? "" : "=",
+                maxS);
     }
+
+    private String getQueryMimeCondition() {
+        HashSet<String> stringHashSet = config.queryMimeTypeHashSet;
+        if (stringHashSet == null) {
+            stringHashSet = new HashSet<>();
+        }
+        if (!TextUtils.isEmpty(config.specifiedFormat)) {
+            stringHashSet.add(config.specifiedFormat);
+        }
+        StringBuilder stringBuilder = new StringBuilder();
+        Iterator<String> iterator = stringHashSet.iterator();
+        int index = -1;
+        while (iterator.hasNext()) {
+            String value = iterator.next();
+            if (TextUtils.isEmpty(value)) {
+                continue;
+            }
+            if (config.chooseMode == PictureMimeType.ofVideo()) {
+                if (value.startsWith(PictureMimeType.MIME_TYPE_PREFIX_IMAGE) || value.startsWith(PictureMimeType.MIME_TYPE_PREFIX_AUDIO)) {
+                    continue;
+                }
+            } else if (config.chooseMode == PictureMimeType.ofImage()) {
+                if (value.startsWith(PictureMimeType.MIME_TYPE_PREFIX_AUDIO) || value.startsWith(PictureMimeType.MIME_TYPE_PREFIX_VIDEO)) {
+                    continue;
+                }
+            } else if (config.chooseMode == PictureMimeType.ofAudio()) {
+                if (value.startsWith(PictureMimeType.MIME_TYPE_PREFIX_VIDEO) || value.startsWith(PictureMimeType.MIME_TYPE_PREFIX_IMAGE)) {
+                    continue;
+                }
+            }
+            index++;
+            stringBuilder.append(index == 0 ? " AND " : " OR ").append(MediaStore.MediaColumns.MIME_TYPE).append("='").append(value).append("'");
+        }
+        if (config.chooseMode != PictureMimeType.ofVideo()) {
+            if (!config.isGif && !stringHashSet.contains(PictureMimeType.ofGIF())) {
+                stringBuilder.append(NOT_GIF);
+            }
+        }
+        return stringBuilder.toString();
+    }
+
 }
